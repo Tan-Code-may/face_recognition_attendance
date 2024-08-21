@@ -1,0 +1,159 @@
+from datetime import datetime, timedelta
+import numpy as np
+import pandas as pd
+import face_recognition
+import pyrebase
+import cv2
+import urllib.request
+import firebase_admin
+from firebase_admin import storage
+
+attendance_file = 'Attendance.csv'
+url = 'http://192.168.190.92/800x600.jpg'
+cv2.namedWindow("Webcam", cv2.WINDOW_AUTOSIZE)
+
+# Check if Attendance.csv exists
+if not cv2.os.path.isfile(attendance_file):
+    # Create a new DataFrame and save it if the file does not exist
+    df = pd.DataFrame(list())
+    df.to_csv(attendance_file, index=False)
+else:
+    print("Attendance.csv exists.")
+
+# Initialize Firebase Admin SDK
+cred = firebase_admin.credentials.Certificate("serviceAccount.json")
+firebase_admin.initialize_app(cred, {
+    "storageBucket": "attendance-face-recognit-f55e6.appspot.com"
+})
+
+# Get a reference to the Firebase Storage bucket
+bucket = storage.bucket()
+
+# Cloud storage configuration
+# Change this to the path of your images folder in Firebase Storage
+cloud_image_folder = 'mini_images'
+
+# List files in the cloud image folder
+blobs = bucket.list_blobs(prefix=cloud_image_folder)
+
+images = []
+classNames = []
+
+# Define the expiration time (e.g., 1 hour from now)
+expiration = datetime.utcnow() + timedelta(hours=1)
+
+flag = True
+# Iterate over the files
+for blob in blobs:
+    if flag:
+        flag = False
+        continue
+
+    file_name_temp = blob.name.split('/')[-1].split('.')[0]
+    print(file_name_temp)
+    file_name = file_name_temp.split('-')[0]
+    classNames.append(file_name)
+
+    # Get the download URL of the file with the specified expiration time
+    download_url = blob.generate_signed_url(expiration=expiration)
+
+    try:
+        # Read the image from the download URL
+        img_resp = urllib.request.urlopen(download_url)
+        img_data = img_resp.read()
+
+        if len(img_data) != 0:
+            img_array = np.asarray(bytearray(img_data), dtype="uint8")
+            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            if img is not None:
+                images.append(img)
+            else:
+                print(f"Error: Failed to decode image {file_name}")
+        else:
+            print(f"Error: Empty image data for {file_name}")
+
+    except urllib.error.HTTPError as e:
+        # Handle HTTP errors (e.g., HTTP 404)
+        if e.code == 404:
+            print(f"HTTP Error 404: Resource not found for {file_name}")
+        else:
+            print(f"HTTP Error: {e}")
+    except Exception as e:
+        print(f"Error downloading image: {str(e)}")
+
+print("Images and names loaded from cloud storage.")
+
+# Function to find encodings of images
+
+
+def findEncodings(images):
+    encodeList = []
+    for img in images:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        face_encodings = face_recognition.face_encodings(img)
+        if len(face_encodings) > 0:
+            encode = face_encodings[0]
+            encodeList.append(encode)
+        else:
+            print("Error: No face detected in the image.")
+    return encodeList
+
+
+def markAttendance(name):
+    with open(attendance_file, 'r+') as f:
+        myDataList = f.readlines()
+        nameList = []
+        for line in myDataList:
+            entry = line.split(',')
+            nameList.append(entry[0])
+        if name not in nameList:
+            now = datetime.now()
+            dtString = now.strftime('%H:%M:%S')
+            f.write(f'\n{name},{dtString}')
+
+
+encodeListKnown = findEncodings(images)
+print('Encoding Complete')
+
+while True:
+    try:
+        img_resp = urllib.request.urlopen(url)
+        imgnp = np.array(bytearray(img_resp.read()), dtype=np.uint8)
+        img = cv2.imdecode(imgnp, -1)
+
+        if img is not None:
+            imgS = cv2.resize(img, (0, 0), None, 0.25, 0.25)
+            imgS = cv2.cvtColor(imgS, cv2.COLOR_BGR2RGB)
+
+            facesCurFrame = face_recognition.face_locations(imgS)
+            encodesCurFrame = face_recognition.face_encodings(
+                imgS, facesCurFrame)
+
+            for encodeFace, faceLoc in zip(encodesCurFrame, facesCurFrame):
+                matches = face_recognition.compare_faces(
+                    encodeListKnown, encodeFace)
+                faceDis = face_recognition.face_distance(
+                    encodeListKnown, encodeFace)
+                matchIndex = np.argmin(faceDis)
+
+                if matches[matchIndex]:
+                    name = classNames[matchIndex].upper()
+                    y1, x2, y2, x1 = faceLoc
+                    y1, x2, y2, x1 = y1 * 4, x2 * 4, y2 * 4, x1 * 4
+                    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.rectangle(img, (x1, y2 - 35), (x2, y2),
+                                  (0, 255, 0), cv2.FILLED)
+                    cv2.putText(img, name, (x1 + 6, y2 - 6),
+                                cv2.FONT_HERSHEY_COMPLEX, 1, (255, 255, 255), 2)
+                    markAttendance(name)
+
+            cv2.imshow('Webcam', img)
+            key = cv2.waitKey(5)
+            if key == ord('q'):
+                break
+        else:
+            print("Error: Empty image received.")
+    except Exception as e:
+        print(f"Error downloading image: {str(e)}")
+
+cv2.destroyAllWindows()
